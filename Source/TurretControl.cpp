@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <unordered_set>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -32,6 +34,9 @@ struct Config {
     bool require_same_tribe = true;
     bool allow_during_pvp_cooldown = false;
     bool show_messages = true;
+    bool hard_cap_enabled = true;
+    int hard_cap_interval_seconds = 2;
+    float hard_cap_scan_radius = 18000.0f;
 
     bool use_permissions = false;
     std::string permission = "TurretControl.Default";
@@ -58,6 +63,7 @@ struct Config {
     std::string no_ammo = "No suitable ammunition found.";
     std::string already_full = "All valid turrets are already at their configured ammo limit.";
     std::string fill_success = "Filled {0} turrets | ARB used: {1} | Shards used: {2}";
+    std::string fill_failed = "Fill failed. Check ArkApi log for TurretControl details.";
     std::string turret_success = "Updated {0} turrets.";
     std::string targeting_unconfigured = "Targeting command is disabled until TargetingValues are configured.";
     std::string pvp_blocked = "You cannot use /fill during PvP cooldown.";
@@ -193,6 +199,171 @@ struct TurretRef {
     int planned = 0;
 };
 
+
+bool ItemMatchesKind(UPrimalItem* item, TurretKind kind) {
+    if (!item || item->bIsBlueprint()() || item->bIsEngram()()) return false;
+    const std::string name = ToLower(GetClassFullName(item));
+    if (kind == TurretKind::Tek) {
+        return name.find("elementshard") != std::string::npos;
+    }
+    if (kind == TurretKind::Heavy || kind == TurretKind::Auto) {
+        return name.find("advancedriflebullet") != std::string::npos ||
+               name.find("riflebullet") != std::string::npos;
+    }
+    return false;
+}
+
+int FamilyQuantity(UPrimalInventoryComponent* inventory, TurretKind kind) {
+    if (!inventory || kind == TurretKind::Unsupported) return 0;
+    int total = 0;
+    const TArray<UPrimalItem*> items = inventory->InventoryItemsField();
+    for (UPrimalItem* item : items) {
+        if (!ItemMatchesKind(item, kind)) continue;
+        total += std::max(0, item->GetItemQuantity());
+    }
+    return total;
+}
+
+int ExactQuantity(UPrimalInventoryComponent* inventory, UClass* item_class) {
+    if (!inventory || !item_class) return 0;
+    TSubclassOf<UPrimalItem> cls(item_class);
+    return inventory->GetItemTemplateQuantity(cls, nullptr, true, false, true, true);
+}
+
+int RemoveExact(UPrimalInventoryComponent* inventory, UClass* item_class, int requested) {
+    if (!inventory || !item_class || requested <= 0) return 0;
+
+    const int before = ExactQuantity(inventory, item_class);
+    if (before <= 0) return 0;
+    const int target = std::min(requested, before);
+
+    const TArray<UPrimalItem*> items = inventory->InventoryItemsField();
+    int attempted = 0;
+    for (UPrimalItem* item : items) {
+        if (attempted >= target) break;
+        if (!item || item->ClassField() != item_class) continue;
+        if (!item->bAllowRemovalFromInventory()() || item->bIsBlueprint()() || item->bIsEngram()()) continue;
+
+        const int qty = item->GetItemQuantity();
+        if (qty <= 0) continue;
+        const int take = std::min(qty, target - attempted);
+
+        if (take < qty) {
+            item->SetQuantity(qty - take, true);
+            inventory->NotifyClientsItemStatus(item, false, false, true, false, false, nullptr, nullptr, false, false, true);
+            attempted += take;
+        } else if (inventory->RemoveItem(&item->ItemIDField(), false, false, true, true)) {
+            attempted += take;
+        }
+    }
+
+    const int after = ExactQuantity(inventory, item_class);
+    return std::clamp(before - after, 0, target);
+}
+
+int AddExact(UPrimalInventoryComponent* inventory, UClass* item_class, TurretKind kind, int requested) {
+    if (!inventory || !item_class || requested <= 0) return 0;
+
+    const int before = FamilyQuantity(inventory, kind);
+
+    TSubclassOf<UPrimalItem> item_cls(item_class);
+    TSubclassOf<UPrimalItem> no_skin;
+    no_skin.uClass = nullptr;
+
+    UPrimalItem::AddNewItem(
+        item_cls,
+        inventory,
+        false,  // bEquipItem
+        false,  // bDontStack
+        0.0f,   // ItemQuality
+        true,   // bForceNoBlueprint
+        requested,
+        false,  // bForceBlueprint
+        0.0f,   // MaxItemDifficultyClamp
+        false,  // CreateOnClient
+        no_skin,
+        0.0f,   // MinRandomQuality
+        false,  // clampStats
+        true    // bIgnoreAbsolueMaxInventory
+    );
+
+    const int after = FamilyQuantity(inventory, kind);
+    return std::clamp(after - before, 0, requested);
+}
+
+int RemoveFamilyOverflow(UPrimalInventoryComponent* inventory, TurretKind kind, int requested) {
+    if (!inventory || requested <= 0) return 0;
+    int remaining = requested;
+    int removed_total = 0;
+
+    const TArray<UPrimalItem*> items = inventory->InventoryItemsField();
+    for (UPrimalItem* item : items) {
+        if (remaining <= 0) break;
+        if (!ItemMatchesKind(item, kind)) continue;
+
+        UClass* cls = item->ClassField();
+        const int qty = std::max(0, item->GetItemQuantity());
+        if (!cls || qty <= 0) continue;
+
+        const int removed = RemoveExact(inventory, cls, std::min(qty, remaining));
+        removed_total += removed;
+        remaining -= removed;
+    }
+    return removed_total;
+}
+
+int TransferFamily(UPrimalInventoryComponent* from, UPrimalInventoryComponent* to,
+                   APrimalStructureTurret* turret, TurretKind kind, int requested) {
+    if (!from || !to || !turret || requested <= 0) return 0;
+
+    const int before_turret = FamilyQuantity(to, kind);
+    int remaining = requested;
+
+    const TArray<UPrimalItem*> items = from->InventoryItemsField();
+    for (UPrimalItem* item : items) {
+        if (remaining <= 0) break;
+        if (!ItemMatchesKind(item, kind)) continue;
+        if (!item->bAllowRemovalFromInventory()()) continue;
+
+        UClass* actual_class = item->ClassField();
+        const int stack_qty = std::max(0, item->GetItemQuantity());
+        if (!actual_class || stack_qty <= 0) continue;
+
+        const int want = std::min(stack_qty, remaining);
+        const int player_before = ExactQuantity(from, actual_class);
+        const int turret_before = FamilyQuantity(to, kind);
+
+        const int removed = RemoveExact(from, actual_class, want);
+        if (removed <= 0) continue;
+
+        const int added = AddExact(to, actual_class, kind, removed);
+
+        if (added < removed) {
+            const int refund = removed - added;
+            const int refunded = AddExact(from, actual_class, kind, refund);
+            if (refunded != refund) {
+                Log::GetLog()->error(
+                    "TurretControl v1.1: refund failed. class='{}' expected={} refunded={}",
+                    GetClassFullName(actual_class), refund, refunded);
+            }
+        }
+
+        const int turret_after = FamilyQuantity(to, kind);
+        Log::GetLog()->info(
+            "TurretControl v1.1 fill: turret='{}' template='{}' player_class='{}' player_before={} turret_before={} requested={} removed={} added={} turret_after={}",
+            GetClassFullName(turret),
+            GetClassFullName(turret->AmmoItemTemplateField().uClass),
+            GetClassFullName(actual_class),
+            player_before, turret_before, want, removed, added, turret_after);
+
+        remaining -= added;
+    }
+
+    const int after_turret = FamilyQuantity(to, kind);
+    return std::clamp(after_turret - before_turret, 0, requested);
+}
+
+
 std::vector<TurretRef> FindTurrets(AShooterPlayerController* pc, bool fill_only) {
     std::vector<TurretRef> result;
     if (!pc) return result;
@@ -237,7 +408,7 @@ std::vector<TurretRef> FindTurrets(AShooterPlayerController* pc, bool fill_only)
         if (fill_only) {
             UPrimalInventoryComponent* inventory = turret->MyInventoryComponentField();
             if (!inventory || !ref.ammo.uClass) continue;
-            ref.current = inventory->GetItemTemplateQuantity(ref.ammo, nullptr, true, false, true, true);
+            ref.current = FamilyQuantity(inventory, kind);
             ref.capacity = std::max(0, LimitFor(kind) - ref.current);
         }
         result.emplace_back(ref);
@@ -251,51 +422,19 @@ std::vector<TurretRef> FindTurrets(AShooterPlayerController* pc, bool fill_only)
 
 int InventoryQuantity(UPrimalInventoryComponent* inventory, TSubclassOf<UPrimalItem> item_class) {
     if (!inventory || !item_class.uClass) return 0;
-    return inventory->GetItemTemplateQuantity(item_class, nullptr, true, false, true, true);
+    return ExactQuantity(inventory, item_class.uClass);
 }
 
 int RemoveFromInventory(UPrimalInventoryComponent* inventory, TSubclassOf<UPrimalItem> item_class, int requested) {
     if (!inventory || !item_class.uClass || requested <= 0) return 0;
-
-    // Work on a snapshot, matching the exact ammo class. The return value is based on the
-    // measured before/after inventory quantity, so a failed RemoveItem cannot be counted as
-    // successfully removed and therefore cannot be turned into duplicated ammo.
-    const int before_total = InventoryQuantity(inventory, item_class);
-    if (before_total <= 0) return 0;
-    const int target = std::min(requested, before_total);
-
-    TArray<UPrimalItem*> matches = inventory->InventoryItemsField();
-    int attempted = 0;
-    for (UPrimalItem* item : matches) {
-        if (attempted >= target) break;
-        if (!item || item->ClassField() != item_class.uClass) continue;
-        if (!item->bAllowRemovalFromInventory()() || item->bIsEngram()() || item->bIsBlueprint()()) continue;
-
-        const int qty = item->GetItemQuantity();
-        if (qty <= 0) continue;
-        const int take = std::min(qty, target - attempted);
-
-        if (take < qty) {
-            item->SetQuantity(qty - take, true);
-            inventory->NotifyClientsItemStatus(item, false, false, true, false, false, nullptr, nullptr, false, false, true);
-            attempted += take;
-        } else if (inventory->RemoveItem(&item->ItemIDField(), false, false, true, true)) {
-            attempted += take;
-        }
-    }
-
-    const int after_total = InventoryQuantity(inventory, item_class);
-    return std::clamp(before_total - after_total, 0, target);
+    return RemoveExact(inventory, item_class.uClass, requested);
 }
 
 int AddToInventory(UPrimalInventoryComponent* inventory, TSubclassOf<UPrimalItem> item_class, int requested) {
     if (!inventory || !item_class.uClass || requested <= 0) return 0;
-    const int before = InventoryQuantity(inventory, item_class);
-    UPrimalItem* incremented = nullptr;
-    inventory->IncrementItemTemplateQuantity(item_class, requested, true, false, nullptr, &incremented,
-        true, false, false, false, false, false, true);
-    const int after = InventoryQuantity(inventory, item_class);
-    return std::max(0, after - before);
+    const std::string n = ToLower(GetClassFullName(item_class.uClass));
+    TurretKind kind = n.find("elementshard") != std::string::npos ? TurretKind::Tek : TurretKind::Heavy;
+    return AddExact(inventory, item_class.uClass, kind, requested);
 }
 
 // Allocates an ammo pool approximately evenly among turrets while respecting each deficit.
@@ -359,30 +498,25 @@ void FillCommandImpl(AShooterPlayerController* pc, FString*, EChatSendMode::Type
     if (turrets.empty()) { Send(pc, g_config.no_turrets); return; }
 
     bool has_deficit = false;
-    for (const auto& t : turrets) has_deficit = has_deficit || t.capacity > 0;
+    int arb_available = FamilyQuantity(player_inventory, TurretKind::Heavy);
+    int shards_available = FamilyQuantity(player_inventory, TurretKind::Tek);
+
+    for (const auto& t : turrets) {
+        if (t.capacity > 0) has_deficit = true;
+    }
     if (!has_deficit) { Send(pc, g_config.already_full); return; }
+    if (arb_available <= 0 && shards_available <= 0) { Send(pc, g_config.no_ammo); return; }
 
-    // Separate pools by actual ammo class, not by assumed PrimalItem blueprint path.
-    // Heavy/Auto normally share ARB; Tek uses Element Shards. Modded derivatives remain safe.
-    struct Pool { TSubclassOf<UPrimalItem> ammo; std::vector<TurretRef*> refs; int available = 0; };
-    std::vector<Pool> pools;
+    std::vector<TurretRef*> arb_refs;
+    std::vector<TurretRef*> shard_refs;
     for (auto& ref : turrets) {
-        if (ref.capacity <= 0 || !ref.ammo.uClass) continue;
-        auto it = std::find_if(pools.begin(), pools.end(), [&](const Pool& p) { return p.ammo.uClass == ref.ammo.uClass; });
-        if (it == pools.end()) {
-            pools.push_back(Pool{ref.ammo, {}, 0});
-            it = pools.end() - 1;
-        }
-        it->refs.push_back(&ref);
+        if (ref.capacity <= 0) continue;
+        if (ref.kind == TurretKind::Tek) shard_refs.push_back(&ref);
+        else if (ref.kind == TurretKind::Heavy || ref.kind == TurretKind::Auto) arb_refs.push_back(&ref);
     }
 
-    int total_available = 0;
-    for (auto& pool : pools) {
-        pool.available = InventoryQuantity(player_inventory, pool.ammo);
-        total_available += pool.available;
-        PlanPool(pool.refs, pool.available);
-    }
-    if (total_available <= 0) { Send(pc, g_config.no_ammo); return; }
+    PlanPool(arb_refs, arb_available);
+    PlanPool(shard_refs, shards_available);
 
     int filled_turrets = 0;
     int arb_used = 0;
@@ -390,51 +524,41 @@ void FillCommandImpl(AShooterPlayerController* pc, FString*, EChatSendMode::Type
 
     for (auto& ref : turrets) {
         if (ref.planned <= 0 || !IsValidTurret(ref.turret)) continue;
-        UPrimalInventoryComponent* turret_inventory = ref.turret->MyInventoryComponentField();
-        if (!turret_inventory || !ref.ammo.uClass) continue;
 
-        // Re-check the live deficit immediately before mutation.
-        const int live_before = InventoryQuantity(turret_inventory, ref.ammo);
-        const int live_deficit = std::max(0, LimitFor(ref.kind) - live_before);
+        UPrimalInventoryComponent* turret_inventory = ref.turret->MyInventoryComponentField();
+        if (!turret_inventory) continue;
+
+        const int live_before = FamilyQuantity(turret_inventory, ref.kind);
+        const int limit = LimitFor(ref.kind);
+        const int live_deficit = std::max(0, limit - live_before);
         const int want = std::min(ref.planned, live_deficit);
         if (want <= 0) continue;
 
-        // Remove first: a failure can at worst lose ammo, never mint extra ammo.
-        const int removed = RemoveFromInventory(player_inventory, ref.ammo, want);
-        if (removed <= 0) continue;
-
-        const int added = AddToInventory(turret_inventory, ref.ammo, removed);
-        if (added < removed) {
-            const int refund = removed - added;
-            const int refunded = AddToInventory(player_inventory, ref.ammo, refund);
-            if (refunded != refund) {
-                Log::GetLog()->error("TurretControl: failed to refund {} of {} ammo after partial turret add", refund - refunded, refund);
-            }
-        }
-
-        // If an unexpected inventory behavior added past our cap, take back only the portion
-        // attributable to this command. Never confiscate ammo that was already in the turret.
-        int net_added = std::min(removed, added);
-        const int live_after = InventoryQuantity(turret_inventory, ref.ammo);
-        const int limit = LimitFor(ref.kind);
-        if (live_after > limit && net_added > 0) {
-            const int overflow_from_this_add = std::min(net_added, live_after - limit);
-            const int taken_back = RemoveFromInventory(turret_inventory, ref.ammo, overflow_from_this_add);
-            if (taken_back > 0) {
-                const int refunded = AddToInventory(player_inventory, ref.ammo, taken_back);
-                if (refunded != taken_back) {
-                    Log::GetLog()->error("TurretControl: failed to refund {} overflow ammo after safety clamp", taken_back - refunded);
-                }
-                net_added -= taken_back;
-            }
-        }
-
-        if (net_added > 0) {
+        const int added = TransferFamily(player_inventory, turret_inventory, ref.turret, ref.kind, want);
+        if (added > 0) {
             ++filled_turrets;
-            if (ref.kind == TurretKind::Tek) shards_used += net_added;
-            else arb_used += net_added;
+            if (ref.kind == TurretKind::Tek) shards_used += added;
+            else arb_used += added;
             ref.turret->UpdateNumBullets();
         }
+
+        const int after = FamilyQuantity(turret_inventory, ref.kind);
+        if (after > limit) {
+            const int overflow = after - limit;
+            const int removed = RemoveFamilyOverflow(turret_inventory, ref.kind, overflow);
+            ref.turret->UpdateNumBullets();
+            Log::GetLog()->warn(
+                "TurretControl v1.1 /fill safety cap: turret='{}' kind={} before={} after={} limit={} overflow_removed={}",
+                GetClassFullName(ref.turret), static_cast<int>(ref.kind), live_before, after, limit, removed);
+        }
+    }
+
+    if (filled_turrets <= 0) {
+        Log::GetLog()->warn(
+            "TurretControl v1.1: /fill found {} valid turrets but transferred nothing. ARB={} Shards={}",
+            turrets.size(), arb_available, shards_available);
+        Send(pc, g_config.fill_failed);
+        return;
     }
 
     std::string message = g_config.fill_success;
@@ -519,6 +643,66 @@ void TurretsCommand(AShooterPlayerController* pc, FString* message, EChatSendMod
     }
 }
 
+
+std::chrono::steady_clock::time_point g_next_hard_cap_check = std::chrono::steady_clock::now();
+
+void HardCapTimer() {
+    if (!g_config.hard_cap_enabled) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now < g_next_hard_cap_check) return;
+    g_next_hard_cap_check = now + std::chrono::seconds(std::max(1, g_config.hard_cap_interval_seconds));
+
+    UWorld* world = ArkApi::GetApiUtils().GetWorld();
+    if (!world) return;
+
+    std::unordered_set<APrimalStructureTurret*> checked;
+
+    const auto& controllers = world->PlayerControllerListField();
+    for (TWeakObjectPtr<APlayerController> weak_pc : controllers) {
+        auto* base_pc = weak_pc.Get();
+        if (!base_pc || !base_pc->IsA(AShooterPlayerController::GetPrivateStaticClass())) continue;
+
+        auto* pc = static_cast<AShooterPlayerController*>(base_pc);
+        AShooterCharacter* character = pc->GetPlayerCharacter();
+        if (!character || !character->RootComponentField()) continue;
+
+        const FVector pos = character->RootComponentField()->RelativeLocationField();
+
+        TArray<AActor*> actors;
+        TSubclassOf<AActor> turret_class(APrimalStructureTurret::GetPrivateStaticClass());
+        UVictoryCore::ServerOctreeOverlapActorsClass(
+            &actors, world, pos, g_config.hard_cap_scan_radius,
+            EServerOctreeGroup::STRUCTURES, turret_class, true);
+
+        for (AActor* actor : actors) {
+            if (!actor || !actor->IsA(APrimalStructureTurret::GetPrivateStaticClass())) continue;
+            auto* turret = static_cast<APrimalStructureTurret*>(actor);
+            if (!IsValidTurret(turret)) continue;
+            if (!checked.insert(turret).second) continue;
+
+            const TurretKind kind = DetectTurretKind(turret);
+            if (kind == TurretKind::Unsupported) continue;
+
+            UPrimalInventoryComponent* inventory = turret->MyInventoryComponentField();
+            if (!inventory) continue;
+
+            const int limit = LimitFor(kind);
+            const int current = FamilyQuantity(inventory, kind);
+            if (current <= limit) continue;
+
+            const int overflow = current - limit;
+            const int removed = RemoveFamilyOverflow(inventory, kind, overflow);
+            turret->UpdateNumBullets();
+
+            Log::GetLog()->warn(
+                "TurretControl v1.1 hard cap: turret='{}' kind={} current={} limit={} overflow={} removed={}",
+                GetClassFullName(turret), static_cast<int>(kind), current, limit, overflow, removed);
+        }
+    }
+}
+
+
 UClass* LoadTurretStructureClass(const std::string& path) {
     if (path.empty()) return nullptr;
     FString fpath(path.c_str());
@@ -553,6 +737,9 @@ Config ParseConfig(const minijson::Value& root) {
     c.require_same_tribe = minijson::boolean(root, "General", "RequireSameTribe", c.require_same_tribe);
     c.allow_during_pvp_cooldown = minijson::boolean(root, "General", "AllowDuringPvpCooldown", c.allow_during_pvp_cooldown);
     c.show_messages = minijson::boolean(root, "General", "ShowMessages", c.show_messages);
+    c.hard_cap_enabled = minijson::boolean(root, "General", "HardCapEnabled", c.hard_cap_enabled);
+    c.hard_cap_interval_seconds = minijson::integer(root, "General", "HardCapIntervalSeconds", c.hard_cap_interval_seconds);
+    c.hard_cap_scan_radius = minijson::number(root, "General", "HardCapScanRadius", c.hard_cap_scan_radius);
 
     c.use_permissions = minijson::boolean(root, "Permissions", "UsePermissions", c.use_permissions);
     c.permission = minijson::str(root, "Permissions", "DefaultPermission", c.permission);
@@ -576,6 +763,7 @@ Config ParseConfig(const minijson::Value& root) {
     c.no_ammo = minijson::str(root, "Messages", "NoAmmo", c.no_ammo);
     c.already_full = minijson::str(root, "Messages", "AlreadyFull", c.already_full);
     c.fill_success = minijson::str(root, "Messages", "FillSuccess", c.fill_success);
+    c.fill_failed = minijson::str(root, "Messages", "FillFailed", c.fill_failed);
     c.turret_success = minijson::str(root, "Messages", "TurretSuccess", c.turret_success);
     c.targeting_unconfigured = minijson::str(root, "Messages", "TargetingUnconfigured", c.targeting_unconfigured);
     c.pvp_blocked = minijson::str(root, "Messages", "PvpBlocked", c.pvp_blocked);
@@ -586,6 +774,8 @@ Config ParseConfig(const minijson::Value& root) {
     c.heavy_ammo_limit = std::max(0, c.heavy_ammo_limit);
     c.tek_ammo_limit = std::max(0, c.tek_ammo_limit);
     c.auto_ammo_limit = std::max(0, c.auto_ammo_limit);
+    c.hard_cap_interval_seconds = std::max(1, c.hard_cap_interval_seconds);
+    c.hard_cap_scan_radius = std::max(1000.0f, c.hard_cap_scan_radius);
     return c;
 }
 
@@ -619,6 +809,9 @@ void UnregisterChatCommands() {
 }
 
 void RegisterChatCommands() {
+    if (!g_registered_fill_command.empty() || !g_registered_turrets_command.empty()) {
+        UnregisterChatCommands();
+    }
     g_registered_fill_command = g_config.fill_command;
     g_registered_turrets_command = g_config.turrets_command;
     ArkApi::GetCommands().AddChatCommand(F(g_registered_fill_command), &FillCommand);
@@ -650,12 +843,15 @@ void Load() {
     ReadConfig();
     LoadCustomClasses();
     RegisterChatCommands();
+    g_next_hard_cap_check = std::chrono::steady_clock::now();
+    ArkApi::GetCommands().AddOnTimerCallback("TurretControl.HardCap", &HardCapTimer);
     ArkApi::GetCommands().AddConsoleCommand("TurretControl.Reload", &ReloadCommand);
     Log::GetLog()->info("Loaded plugin - TurretControl");
 }
 
 void Unload() {
     UnregisterChatCommands();
+    ArkApi::GetCommands().RemoveOnTimerCallback("TurretControl.HardCap");
     ArkApi::GetCommands().RemoveConsoleCommand("TurretControl.Reload");
     g_pvp_checker = nullptr;
     g_custom_heavy.clear(); g_custom_tek.clear(); g_custom_auto.clear();

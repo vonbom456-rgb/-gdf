@@ -8,7 +8,10 @@
     "AutoTurretAmmoLimit": 1000,
     "RequireSameTribe": true,
     "AllowDuringPvpCooldown": false,
-    "ShowMessages": true
+    "ShowMessages": true,
+    "HardCapEnabled": true,
+    "HardCapIntervalSeconds": 2,
+    "HardCapScanRadius": 18000
   },
   "Permissions": {
     "UsePermissions": false,
@@ -42,6 +45,7 @@
     "TargetingUnconfigured": "Targeting command is disabled until TargetingValues are configured.",
     "PvpBlocked": "You cannot use /fill during PvP cooldown.",
     "ReloadOk": "TurretControl config reloaded.",
-    "ReloadFailed": "TurretControl config reload failed."
+    "ReloadFailed": "TurretControl config reload failed.",
+    "FillFailed": "Fill failed. Check ArkApi log for TurretControl details."
   }
 }
