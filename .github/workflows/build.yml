@@ -1,0 +1,89 @@
+name: Build TurretControl
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - "Source/**"
+      - "TurretControl/**"
+      - "TurretControl.sln"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    name: Build Release x64
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout TurretControl
+        uses: actions/checkout@v4
+
+      - name: Checkout ArkApi 3.56 SDK
+        shell: pwsh
+        run: |
+          git clone https://github.com/ArkServerApi/AseApi.git "$env:GITHUB_WORKSPACE\AseApi"
+          Set-Location "$env:GITHUB_WORKSPACE\AseApi"
+          git checkout f13b85979254b6b19c8d9255a0fc11c128978b8b
+          "ARKAPI_ROOT=$env:GITHUB_WORKSPACE\AseApi" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify ArkApi 3.56
+        shell: pwsh
+        run: |
+          $apiFile = Join-Path $env:ARKAPI_ROOT "version\Core\Private\Ark\ArkBaseApi.cpp"
+          if (!(Test-Path $apiFile)) {
+            throw "ArkApi source file not found: $apiFile"
+          }
+          $content = Get-Content $apiFile -Raw
+          if ($content -notmatch 'api_version\s*=\s*3\.56f') {
+            throw "Checked-out AseApi revision is not ArkApi 3.56"
+          }
+          $lib = Join-Path $env:ARKAPI_ROOT "out_lib\ArkApi.lib"
+          if (!(Test-Path $lib)) {
+            throw "ArkApi.lib not found: $lib"
+          }
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build TurretControl
+        shell: pwsh
+        run: |
+          msbuild "$env:GITHUB_WORKSPACE\TurretControl.sln" `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:ARKAPI_ROOT="$env:ARKAPI_ROOT"
+
+      - name: Prepare plugin artifact
+        shell: pwsh
+        run: |
+          $out = "$env:GITHUB_WORKSPACE\artifact\TurretControl"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $dllCandidates = @(
+            "$env:GITHUB_WORKSPACE\dist\TurretControl\TurretControl.dll",
+            "$env:GITHUB_WORKSPACE\x64\Release\TurretControl.dll",
+            "$env:GITHUB_WORKSPACE\TurretControl\x64\Release\TurretControl.dll"
+          )
+
+          $dll = $dllCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (!$dll) {
+            $dll = Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Filter "TurretControl.dll" -Recurse |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (!$dll) {
+            throw "TurretControl.dll was not produced"
+          }
+
+          Copy-Item $dll "$out\TurretControl.dll" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\Plugin\config.json" "$out\config.json" -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\Plugin\PluginInfo.json" "$out\PluginInfo.json" -Force
+
+      - name: Upload TurretControl
+        uses: actions/upload-artifact@v4
+        with:
+          name: TurretControl-Release-x64
+          path: artifact/TurretControl/
+          if-no-files-found: error
+          retention-days: 30
