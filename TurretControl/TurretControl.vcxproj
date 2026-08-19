@@ -78,7 +78,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <PrecompiledHeader></PrecompiledHeader>
-      <PreprocessorDefinitions>_DEBUG;_WINDOWS;_USRDLL;TURRETCONTROL_WITH_PERMISSIONS=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NOMINMAX;_DEBUG;_WINDOWS;_USRDLL;TURRETCONTROL_WITH_PERMISSIONS=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ArkApiRoot)\version\Core\Public;$(ArkApiRoot)\include;..\Source;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <ExceptionHandling>Sync</ExceptionHandling>
@@ -100,7 +100,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PrecompiledHeader></PrecompiledHeader>
-      <PreprocessorDefinitions>NDEBUG;_WINDOWS;_USRDLL;TURRETCONTROL_WITH_PERMISSIONS=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NOMINMAX;NDEBUG;_WINDOWS;_USRDLL;TURRETCONTROL_WITH_PERMISSIONS=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ArkApiRoot)\version\Core\Public;$(ArkApiRoot)\include;..\Source;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <ExceptionHandling>Sync</ExceptionHandling>
@@ -130,7 +130,7 @@ copy /Y "$(SolutionDir)Plugin\PluginInfo.json" "$(SolutionDir)dist\TurretControl
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PrecompiledHeader></PrecompiledHeader>
-      <PreprocessorDefinitions>NDEBUG;_WINDOWS;_USRDLL;TURRETCONTROL_WITH_PERMISSIONS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NOMINMAX;NDEBUG;_WINDOWS;_USRDLL;TURRETCONTROL_WITH_PERMISSIONS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(ArkApiRoot)\version\Core\Public;$(ArkApiRoot)\include;$(PermissionsRoot)\Permissions\Public;..\Source;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <ExceptionHandling>Sync</ExceptionHandling>
