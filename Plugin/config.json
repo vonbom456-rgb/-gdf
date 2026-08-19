@@ -11,7 +11,8 @@
     "ShowMessages": true,
     "HardCapEnabled": true,
     "HardCapIntervalSeconds": 2,
-    "HardCapScanRadius": 18000
+    "HardCapScanRadius": 18000,
+    "InventoryCapEnabled": true
   },
   "Permissions": {
     "UsePermissions": false,

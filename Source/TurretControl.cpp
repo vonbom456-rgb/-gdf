@@ -34,6 +34,7 @@ struct Config {
     bool require_same_tribe = true;
     bool allow_during_pvp_cooldown = false;
     bool show_messages = true;
+    bool inventory_cap_enabled = true;
     bool hard_cap_enabled = true;
     int hard_cap_interval_seconds = 2;
     float hard_cap_scan_radius = 18000.0f;
@@ -80,6 +81,14 @@ std::vector<UClass*> g_custom_auto;
 
 using PvpCooldownChecker = bool(__fastcall*)(AShooterPlayerController*);
 PvpCooldownChecker g_pvp_checker = nullptr;
+
+
+DECLARE_HOOK(UPrimalInventoryComponent_AllowAddInventoryItem_MaxQuantity,
+    bool,
+    UPrimalInventoryComponent*,
+    UPrimalItem*,
+    const int*,
+    int*);
 
 std::string ConfigPath() {
     return ArkApi::Tools::GetCurrentDir() + "/ArkApi/Plugins/TurretControl/config.json";
@@ -644,6 +653,63 @@ void TurretsCommand(AShooterPlayerController* pc, FString* message, EChatSendMod
 }
 
 
+
+APrimalStructureTurret* GetTurretOwner(UPrimalInventoryComponent* inventory) {
+    if (!inventory) return nullptr;
+    AActor* owner = inventory->GetOwner();
+    if (!owner || !owner->IsA(APrimalStructureTurret::GetPrivateStaticClass())) return nullptr;
+    return static_cast<APrimalStructureTurret*>(owner);
+}
+
+bool Hook_UPrimalInventoryComponent_AllowAddInventoryItem_MaxQuantity(
+    UPrimalInventoryComponent* inventory,
+    UPrimalItem* item,
+    const int* requested_quantity_in,
+    int* requested_quantity_out)
+{
+    const bool original_allowed =
+        UPrimalInventoryComponent_AllowAddInventoryItem_MaxQuantity_original(
+            inventory, item, requested_quantity_in, requested_quantity_out);
+
+    if (!original_allowed || !g_config.inventory_cap_enabled || !inventory || !item)
+        return original_allowed;
+
+    APrimalStructureTurret* turret = GetTurretOwner(inventory);
+    if (!turret || !IsValidTurret(turret))
+        return original_allowed;
+
+    const TurretKind kind = DetectTurretKind(turret);
+    if (kind == TurretKind::Unsupported || !ItemMatchesKind(item, kind))
+        return original_allowed;
+
+    const int limit = LimitFor(kind);
+    const int current = FamilyQuantity(inventory, kind);
+    const int remaining = std::max(0, limit - current);
+
+    int original_max = requested_quantity_out ? *requested_quantity_out
+        : (requested_quantity_in ? *requested_quantity_in : 0);
+    if (original_max < 0) original_max = 0;
+
+    const int allowed = std::min(original_max, remaining);
+
+    if (requested_quantity_out)
+        *requested_quantity_out = allowed;
+
+    Log::GetLog()->debug(
+        "TurretControl v1.2 inventory cap: turret='{}' item='{}' current={} limit={} requested={} original_allowed={} final_allowed={}",
+        GetClassFullName(turret),
+        GetClassFullName(item),
+        current,
+        limit,
+        requested_quantity_in ? *requested_quantity_in : original_max,
+        original_max,
+        allowed);
+
+    // Returning false when nothing may be inserted keeps the source stack intact.
+    return allowed > 0;
+}
+
+
 std::chrono::steady_clock::time_point g_next_hard_cap_check = std::chrono::steady_clock::now();
 
 void HardCapTimer() {
@@ -737,6 +803,7 @@ Config ParseConfig(const minijson::Value& root) {
     c.require_same_tribe = minijson::boolean(root, "General", "RequireSameTribe", c.require_same_tribe);
     c.allow_during_pvp_cooldown = minijson::boolean(root, "General", "AllowDuringPvpCooldown", c.allow_during_pvp_cooldown);
     c.show_messages = minijson::boolean(root, "General", "ShowMessages", c.show_messages);
+    c.inventory_cap_enabled = minijson::boolean(root, "General", "InventoryCapEnabled", c.inventory_cap_enabled);
     c.hard_cap_enabled = minijson::boolean(root, "General", "HardCapEnabled", c.hard_cap_enabled);
     c.hard_cap_interval_seconds = minijson::integer(root, "General", "HardCapIntervalSeconds", c.hard_cap_interval_seconds);
     c.hard_cap_scan_radius = minijson::number(root, "General", "HardCapScanRadius", c.hard_cap_scan_radius);
@@ -843,14 +910,19 @@ void Load() {
     ReadConfig();
     LoadCustomClasses();
     RegisterChatCommands();
+    ArkApi::GetHooks().SetHook("UPrimalInventoryComponent.AllowAddInventoryItem_MaxQuantity",
+        &Hook_UPrimalInventoryComponent_AllowAddInventoryItem_MaxQuantity,
+        &UPrimalInventoryComponent_AllowAddInventoryItem_MaxQuantity_original);
     g_next_hard_cap_check = std::chrono::steady_clock::now();
     ArkApi::GetCommands().AddOnTimerCallback("TurretControl.HardCap", &HardCapTimer);
     ArkApi::GetCommands().AddConsoleCommand("TurretControl.Reload", &ReloadCommand);
-    Log::GetLog()->info("Loaded plugin - TurretControl");
+    Log::GetLog()->info("Loaded plugin - TurretControl v1.2 InventoryCap");
 }
 
 void Unload() {
     UnregisterChatCommands();
+    ArkApi::GetHooks().DisableHook("UPrimalInventoryComponent.AllowAddInventoryItem_MaxQuantity",
+        &Hook_UPrimalInventoryComponent_AllowAddInventoryItem_MaxQuantity);
     ArkApi::GetCommands().RemoveOnTimerCallback("TurretControl.HardCap");
     ArkApi::GetCommands().RemoveConsoleCommand("TurretControl.Reload");
     g_pvp_checker = nullptr;
